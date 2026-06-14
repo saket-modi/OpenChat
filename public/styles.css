@@ -1,0 +1,57 @@
+body {
+    background-color: black;
+}
+.chatContainer {
+    border: 2px solid white;
+    box-shadow: 0 0 1px 1px white;
+    margin: 0.5em;
+    padding: 0.5em;
+    border-radius: 0.25em;
+}
+.chatBottom {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+}
+.chatBottom #messageBox {
+    field-sizing: content;
+    min-width: 95%;
+    max-width: 95%;
+}
+.chatBottom #sendButton {
+    width: auto;
+    height: auto;
+    border-radius: 50%;
+    margin-left: 1.5em;
+    background-color: rgb(18, 112, 252);
+    border: 2px solid white;
+    color: white;
+}
+.chatBottom #sendButton:hover {
+    background-color: rgb(118, 173, 255);
+    cursor: pointer;
+}
+.chatBottom #sendButton:active {
+    background-color: rgb(161, 199, 255);
+    cursor: default;
+}
+.chatArea {
+    background-color: rgb(0, 0, 0);
+    margin: 5px;
+    padding: 0.25em;
+    min-height: 200px;
+    height: fit-content;
+    border: 2px solid rgb(118, 173, 255);
+    box-shadow: 0 0 2px 2px rgb(161, 199, 255);
+    color: white;
+    border-radius: 0.25em;
+    overflow-y: auto;
+}
+.chatArea p {
+    background-color: rgb(175, 79, 0);
+    padding: 0.25em;
+    border: 1px solid white;
+    border-radius: 0.25em;
+    box-shadow: 0 0 1px 1px white;
+    margin: 0;
+}
