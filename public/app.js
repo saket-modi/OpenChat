@@ -4,7 +4,7 @@ const sendBtn = document.getElementById("sendButton")
 const msgBox = document.getElementById("messageBox")
 const chatArea = document.getElementById("chatArea")
 const socket = null
-const host = "ws://"
+const host = "ws://localhost:6767"
 
 let messages = []
 

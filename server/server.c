@@ -7,12 +7,161 @@
 #include <stdio.h>
 #include <openssl/sha.h> // for hashing
 #include <openssl/evp.h> // for base64 encoding
+#include <stdint.h>
 
 #define MAX_CLIENTS 10
+
+// SOCKET OP CONSTANTS 
+#define WS_OP_TEXT = 0x1;
+#define WS_OP_BIN = 0x2;
+#define WS_OP_CLOSE = 0x8;
+#define WS_OP_PING = 0x9;
+#define WS_OP_PONG = 0xA;
 
 int remove_socket(struct pollfd *fds, int i, int* num_clients) {
     close(fds[i].fd);
     fds[i] = fds[--(*num_clients)];
+}
+
+int send_pong(int fd) {
+    char payload[] = "PONG!";
+    int payload_len = 5;
+
+    char frame_header[2];
+    frame_header[0] = 0x80 + WS_OP_PONG;
+    frame_header[1] = 5;
+
+    int status;
+    if ((status = send(fd, frame_header, 2, 0)) < 0) {
+        return -1;
+    }
+    if ((status = send(fd, payload, payload_len, 0)) < 0) {
+        return -1;
+    }
+}
+
+// SENDING & RECEIVING LOGIC FOLLOWS RFC 6455 (https://datatracker.ietf.org/doc/html/rfc6455)
+int send_sock(int fd, char* payload) {
+    // SENDING TO A CLIENT (payload is the string of text to be sent)
+    int status;
+    char buffer[BUFSIZ];
+    char frame_header[10];
+    int payload_len = strlen(payload), header_len = 1;
+
+    frame_header[0] = 0x80 + WS_OP_TEXT; // FIN + OPCODE
+
+    /*
+        Here, FIN = 1, RSV1 = RSV2 = RSV3 = 0, OPCODE = WS_OP_TEXT
+    */
+    if (payload_len <= 125) {
+        frame[1] = payload_len;
+        header_len = 2;
+    } else if (payload_len <= UINT16_MAX) {
+        frame[1] = 126;
+        frame[2] = payload_len << 8;
+        frame[3] = payload_len >> 8;
+        header_len = 4;
+    } else {
+        frame[1] = 127;
+        frame[2] = payload_len << 56;
+        frame[3] = (payload_len << 48) >> 8;
+        frame[4] = (payload_len << 40) >> 16;
+        frame[5] = (payload_len << 32) >> 24;
+        frame[6] = (payload_len << 24) >> 32;
+        frame[7] = (payload_len << 16) >> 40;
+        frame[8] = (payload_len << 8) >> 48;
+        frame[9] = payload_len >> 56;
+        header_len = 10;
+    }
+
+    // MSG_NOSIGNAL returns -1 in case the client abruptly closes the browser tab
+    if ((status = send(fd, frame_header, header_len, MSG_NOSIGNAL)) < 0) {
+        return -1;
+    }
+    if ((status = send(fd, payload, payload_len, MSG_NOSIGNAL)) < 0) {
+        return -1;
+    }
+    return header_len + payload_len;
+}
+
+int recv_full(int fd, char* buffer, int len) {
+    /*
+        Each subsequent payload will contain its own headers, masking key, etc.
+    */
+    return 0;
+}
+
+int recv_sock(int fd, char* buffer, char** res) {
+    // RECEVING FROM A CLIENT
+    int len, fin = 0, opcode;
+
+    if ((len = recv(fd, buffer, BUFSIZ)) < 0) return -1;
+    buffer[len] = '\0';
+    int offset = 0; // processed bytes
+
+    // buffer now contains a masked value
+    // FIRST BYTE: FIN, RSV1, RSV2, RSV3, OPCODE(4)
+    fin = buffer[offset] >> 7;
+
+    if (!fin) {
+        return -1;
+        // int status = recv_full(fd, buffer, len);
+        // if (status < 0) return -1;
+    }
+
+    // 0x40 = 01000 0000
+    int rsv1 = buffer[offset] & 0x40, rsv2 = buffer[offset] & 0x20, rsv3 = buffer[offset] & 0x10;
+    if (rsv1 || rsv2 || rsv3) return -1; // they should be 0
+    opcode = buffer[offset] & 0x0F;
+
+    if (opcode == WS_OP_PING) {
+        send_pong(fd);
+        return 0;
+    }
+
+    offset = 1; 
+
+    // SECOND BYTE: MASK, PAYLOAD_LENGTH(7)
+    int has_mask = buffer[offset] >> 7;
+    if (!has_mask) return -1; // all data from client to server must be masked
+
+    int payload_length = buffer[1] & 0x7F; // 0111 1111
+    offset = 2;
+    if (payload_length == 126) {
+        // next 2 bytes
+        payload_length = (buffer[offset] << 8) + buffer[offset + 1]; 
+        offset += 2;
+    }
+    else if (payload_length == 127) {
+        // next 8 bytes
+        payload_length = 0;
+        for (int i = offset; i < offset + 8; i++)
+            payload_length = (payload_length << 8) | buffer[i];
+        offset += 8;
+    }
+
+    if (len < offset + 4) {
+        // masking key not found
+        return -1;
+    }
+
+    char* mask = &buffer[offset]; // there are four mask keys, to be alternated with MOD 4
+    offset += 4;
+
+    if (len < offset + payload_length) {
+        // the length of the text should match the actual payload received for malloc-ing
+        return -1;
+    }
+    char* payload = &buffer[offset];
+
+    *res = malloc(payload_length + 1);
+
+    for (int i = 0; i < payload_length; i++) {
+        (*res)[i] = (char)(payload[i] ^ mask[i % 4]);
+    }
+    (*res)[payload_length] = '\0';
+
+    return opcode;
 }
 
 int handshake(int client_fd) {
@@ -82,7 +231,7 @@ int main() {
     hints.ai_flags = AI_PASSIVE;
     int status, fd;
     
-    if ((status = getaddrinfo(NULL, "80", &hints, &res)) != 0) {
+    if ((status = getaddrinfo(NULL, "6767", &hints, &res)) != 0) {
         fprintf(stderr, "Error occurred: %s\n", gai_strerror(status));
         exit(EXIT_FAILURE);
     }
