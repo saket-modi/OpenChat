@@ -43,11 +43,12 @@ async function sendMessage() {
     addMessage(`[Me @ ${time}]: ${msg}`)
     updateChatArea()
 }
+
 function recvMessage(msgData) {
     let user = msgData.user.trim()
     let txt = msgData.text.trim()
-    let time = msgData.timestamp
-    addMessage(`[${user} @ ${time}]: ${msg}`)
+    let time = msgData.time
+    addMessage(`[${user} @ ${time}]: ${txt}`)
     updateChatArea()
 }
 

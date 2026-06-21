@@ -8,15 +8,30 @@
 #include <openssl/sha.h> // for hashing
 #include <openssl/evp.h> // for base64 encoding
 #include <stdint.h>
+#include <time.h>
 
 #define MAX_CLIENTS 10
 
 // SOCKET OP CONSTANTS 
-#define WS_OP_TEXT 0x1;
-#define WS_OP_BIN 0x2;
-#define WS_OP_CLOSE 0x8;
-#define WS_OP_PING 0x9;
-#define WS_OP_PONG 0xA;
+#define WS_OP_TEXT 0x1
+#define WS_OP_BIN 0x2
+#define WS_OP_CLOSE 0x8
+#define WS_OP_PING 0x9
+#define WS_OP_PONG 0xA
+
+char* str_to_JSON(char* text, int user) {
+    time_t raw_time;
+    struct tm *utc_time;
+    char time_buffer[100];
+
+    time(&raw_time);
+    utc_time = gmtime(&raw_time);
+    strftime(time_buffer, 100, "%Y-%m-%d %H:%M:%S UTC", utc_time);
+
+    char* res = malloc(BUFSIZ);
+    snprintf(res, BUFSIZ, "{\"user\": %d, \"text\": \"%s\", \"time\": \"%s\"}", user, text, time_buffer);
+    return res;
+}
 
 int remove_socket(struct pollfd *fds, int i, int* num_clients) {
     close(fds[i].fd);
@@ -46,6 +61,7 @@ int send_sock(int fd, char* payload) {
     int status;
     char buffer[BUFSIZ];
     char frame[10];
+    payload = str_to_JSON(payload, fd);
     int payload_len = strlen(payload), header_len = 1;
 
     frame[0] = 0x80 + WS_OP_TEXT; // FIN + OPCODE
@@ -78,9 +94,11 @@ int send_sock(int fd, char* payload) {
     if ((status = send(fd, frame_header, header_len, MSG_NOSIGNAL)) < 0) {
         return -1;
     }
+    
     if ((status = send(fd, payload, payload_len, MSG_NOSIGNAL)) < 0) {
         return -1;
     }
+    free(payload);
     return header_len + payload_len;
 }
 
@@ -161,7 +179,7 @@ int recv_sock(int fd, char* buffer, char** res) {
     }
     (*res)[payload_length] = '\0';
 
-    return opcode;
+    return len;
 }
 
 int handshake(int client_fd) {
@@ -287,19 +305,16 @@ int main() {
                     // remove socket connection to add page to bfcache
                     remove_socket(fds, i, &num_clients);
                 } else {
-                    char buffer[BUFSIZ], **res;
+                    char buffer[BUFSIZ], *res = NULL;
                     int buf_size;
 
-                    if ((buf_size = recv_sock(fds[i].fd, buffer, res)) < 0) {
+                    if ((buf_size = recv_sock(fds[i].fd, buffer, &res)) < 0) {
                         fprintf(stderr, "Couldn't receive data from client with file descriptor: %d", fds[i].fd);
                     }
                     if (buf_size == 0) {
                         remove_socket(fds, i, &num_clients);
                         continue;
                     }
-
-                    // close string recv'd
-                    res[buf_size] = '\0';
 
                     for (int j = 1; j < num_clients + 1; j++) {
                         if (j == i) continue; // don't send msg to same user
