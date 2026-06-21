@@ -12,11 +12,11 @@
 #define MAX_CLIENTS 10
 
 // SOCKET OP CONSTANTS 
-#define WS_OP_TEXT = 0x1;
-#define WS_OP_BIN = 0x2;
-#define WS_OP_CLOSE = 0x8;
-#define WS_OP_PING = 0x9;
-#define WS_OP_PONG = 0xA;
+#define WS_OP_TEXT 0x1;
+#define WS_OP_BIN 0x2;
+#define WS_OP_CLOSE 0x8;
+#define WS_OP_PING 0x9;
+#define WS_OP_PONG 0xA;
 
 int remove_socket(struct pollfd *fds, int i, int* num_clients) {
     close(fds[i].fd);
@@ -45,10 +45,10 @@ int send_sock(int fd, char* payload) {
     // SENDING TO A CLIENT (payload is the string of text to be sent)
     int status;
     char buffer[BUFSIZ];
-    char frame_header[10];
+    char frame[10];
     int payload_len = strlen(payload), header_len = 1;
 
-    frame_header[0] = 0x80 + WS_OP_TEXT; // FIN + OPCODE
+    frame[0] = 0x80 + WS_OP_TEXT; // FIN + OPCODE
 
     /*
         Here, FIN = 1, RSV1 = RSV2 = RSV3 = 0, OPCODE = WS_OP_TEXT
@@ -58,19 +58,19 @@ int send_sock(int fd, char* payload) {
         header_len = 2;
     } else if (payload_len <= UINT16_MAX) {
         frame[1] = 126;
-        frame[2] = payload_len << 8;
-        frame[3] = payload_len >> 8;
+        frame[2] = (payload_len >> 8) & 0xFF;
+        frame[3] = payload_len & 0xFF;
         header_len = 4;
     } else {
         frame[1] = 127;
-        frame[2] = payload_len << 56;
-        frame[3] = (payload_len << 48) >> 8;
-        frame[4] = (payload_len << 40) >> 16;
-        frame[5] = (payload_len << 32) >> 24;
-        frame[6] = (payload_len << 24) >> 32;
-        frame[7] = (payload_len << 16) >> 40;
-        frame[8] = (payload_len << 8) >> 48;
-        frame[9] = payload_len >> 56;
+        frame_header[2] = (payload_len >> 56) & 0xFF;
+        frame_header[3] = (payload_len >> 48) & 0xFF;
+        frame_header[4] = (payload_len >> 40) & 0xFF;
+        frame_header[5] = (payload_len >> 32) & 0xFF;
+        frame_header[6] = (payload_len >> 24) & 0xFF;
+        frame_header[7] = (payload_len >> 16) & 0xFF;
+        frame_header[8] = (payload_len >> 8) & 0xFF;
+        frame_header[9] =  payload_len & 0xFF;
         header_len = 10;
     }
 
@@ -199,7 +199,7 @@ int handshake(int client_fd) {
         SHA1((unsigned char*)to_hash, strlen(to_hash), sha1_result);
 
         // Base64
-        int bytes_written = EVP_EncodeBlock(encoded, to_hash, strlen(to_hash));
+        int bytes_written = EVP_EncodeBlock(encoded, sha1_result, SHA_DIGEST_LENGTH);
         encoded[bytes_written] = '\0';
         
         free(val);
@@ -214,8 +214,7 @@ int handshake(int client_fd) {
             free(encoded);
             return;
         }
-        free(confirmation);
-        free(encoded);
+
     } else {
         fprintf(stderr, "Could not perform handshake for client with file descriptor: %d", client_fd);
         return;
@@ -278,7 +277,7 @@ int main() {
 
                     if (num_clients >= MAX_CLIENTS) {
                         char error_msg[] = "Maximum client limit reached, cannot connect.";
-                        send(client_fd, error_msg, strlen(error_msg), 0);
+                        send_sock(client_fd, error_msg);
                         close(client_fd);
                     } else {
                         fds[++num_clients] = (struct pollfd){client_fd, POLLIN};
@@ -288,10 +287,10 @@ int main() {
                     // remove socket connection to add page to bfcache
                     remove_socket(fds, i, &num_clients);
                 } else {
-                    char buffer[BUFSIZ];
+                    char buffer[BUFSIZ], **res;
                     int buf_size;
 
-                    if ((buf_size = recv(fds[i].fd, buffer, BUFSIZ, 0)) < 0) {
+                    if ((buf_size = recv_sock(fds[i].fd, buffer, res)) < 0) {
                         fprintf(stderr, "Couldn't receive data from client with file descriptor: %d", fds[i].fd);
                     }
                     if (buf_size == 0) {
@@ -300,11 +299,11 @@ int main() {
                     }
 
                     // close string recv'd
-                    buffer[buf_size] = '\0';
+                    res[buf_size] = '\0';
 
                     for (int j = 1; j < num_clients + 1; j++) {
                         if (j == i) continue; // don't send msg to same user
-                        send(fds[j].fd, buffer, strlen(buffer), 0);
+                        send_sock(fds[j].fd, *res);
                     }
                 }
             }
