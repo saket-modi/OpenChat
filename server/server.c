@@ -122,7 +122,7 @@ int send_pong(int fd, char* payload) {
     if (strlen(payload) > 125) {
         payload[124] = '\0';
     }
-    int payload_len = strlen(payload);
+    uint64_t payload_len = strlen(payload);
 
     unsigned char frame_header[2];
     frame_header[0] = 0x80 + WS_OP_PONG;
@@ -144,7 +144,7 @@ int send_sock(int fd, int sender_fd, unsigned char* payload) {
     int status;
     unsigned char frame[10];
     payload = str_to_JSON(payload, sender_fd);
-    int payload_len = strlen(payload), header_len = 1;
+    uint64_t payload_len = strlen(payload), header_len = 1;
 
     frame[0] = 0x80 + WS_OP_TEXT; // FIN + OPCODE
 
@@ -207,8 +207,11 @@ int get_fd_idx(struct pollfd* fds, int fd, int num_clients) {
 int closing_handshake(struct pollfd* fds, int fd, int* num_clients) {
     int idx = get_fd_idx(fds, fd, *num_clients);
     if (idx < 0) return 0; // already removed
-    unsigned char payload[] = "CLOSE CONNECTION!";
-    int payload_len = strlen(payload);
+    unsigned char payload[2];
+    uint16_t code = 1000;
+    payload[0] = code >> 8;
+    payload[1] = code & 0xFF;
+    int payload_len = 2;
     unsigned char frame_header[2]; // a char is just an 8-bit integer in C
     frame_header[0] = 0x80 + WS_OP_CLOSE;
     frame_header[1] = payload_len; // no mask
@@ -216,11 +219,10 @@ int closing_handshake(struct pollfd* fds, int fd, int* num_clients) {
     if (send(fd, frame_header, 2, MSG_NOSIGNAL) < 0) {
         return -1;
     }
-    if (send(fd, payload, strlen(payload), MSG_NOSIGNAL) < 0) {
+    if (send(fd, payload, 2, MSG_NOSIGNAL) < 0) {
         return -1;
     }
-    int idx = get_fd_idx(fds, fd, *num_clients);
-    if (idx < 0) return 0; // already removed connection
+    // technically should wait for the peer to send a close connection as well
     remove_socket(fds, idx, num_clients);
     return 0;
 }
@@ -260,7 +262,8 @@ int recv_sock(int fd, unsigned char* buffer, unsigned char** res, struct pollfd*
 
     if (opcode == WS_OP_CLOSE) {
         closing_handshake(fds, fd, num_clients);
-        remove_socket(fds, i, num_clients);
+        int idx = get_fd_idx(fds, fd, *num_clients);
+        remove_socket(fds, idx, num_clients);
         return -10;
     }
 
@@ -270,7 +273,7 @@ int recv_sock(int fd, unsigned char* buffer, unsigned char** res, struct pollfd*
         case WS_OP_PING:
         case WS_OP_PONG:
         case WS_OP_CLOSE:
-            return -1;
+            break;
 
         default:
             return -1;
@@ -282,7 +285,7 @@ int recv_sock(int fd, unsigned char* buffer, unsigned char** res, struct pollfd*
     int has_mask = buffer[offset] >> 7;
     if (!has_mask) return -1; // all data from client to server must be masked
 
-    int payload_length = buffer[1] & 0x7F; // 0111 1111
+    uint64_t payload_length = buffer[1] & 0x7F; // 0111 1111
     offset = 2;
     if (payload_length == 126) {
         // next 2 bytes
@@ -383,7 +386,7 @@ int main() {
                     int client_fd = accept(fd, NULL, NULL);
                     
                     if (client_fd == -1) continue; // couldn't get client fd
-                    fcntl(client_fd, F_SETFL, O_NONBLOCK); // making the client non-blocking for recv() and send() ops
+                    // fcntl(client_fd, F_SETFL, O_NONBLOCK); // making the client non-blocking for recv() and send() ops
 
                     // handshake + latency
                     struct timespec start, end;
@@ -412,6 +415,7 @@ int main() {
                 else if (fds[i].revents & POLLHUP) { // connection terminated
                     // remove socket connection to add page to bfcache
                     remove_socket(fds, i, &num_clients);
+                    i--;
                 } else {
                     unsigned char buffer[BUFSIZ], *res = NULL;
                     int buf_size;
@@ -427,6 +431,7 @@ int main() {
                     if (buf_size == -10) continue; // PING PONG logic | CLOSE logic
                     if (buf_size == 0) {
                         remove_socket(fds, i, &num_clients);
+                        i--; // remove curr socket, then i+1th socket takes its place but is not processed
                         continue;
                     }
 
