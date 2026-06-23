@@ -54,9 +54,8 @@ char* str_to_JSON(char* text, int user) {
 }
 
 int remove_socket(struct pollfd *fds, int i, int* num_clients) {
-    if (close(fds[i].fd) < 0) {
-        return -1;
-    }
+    if (i < 0) return -1;
+    close(fds[i].fd);
     fds[i] = fds[(*num_clients)--];
     return 0;
 }
@@ -66,8 +65,12 @@ int handshake(int client_fd) {
     unsigned char buffer[BUFSIZ];
     int bytes_recv = 0;
     
-    if ((bytes_recv = recv(client_fd, buffer, BUFSIZ - 1, 0)) <= 0) {
+    if ((bytes_recv = recv(client_fd, buffer, BUFSIZ - 1, 0)) < 0) {
         fprintf(stderr, "Could not perform handshake for client with file descriptor: %d\n", client_fd);
+        return -1;
+    }
+    if (bytes_recv == 0) {
+        close(client_fd);
         return -1;
     }
     buffer[bytes_recv] = '\0';
@@ -84,12 +87,13 @@ int handshake(int client_fd) {
         int idx = 0;
 
         while (idx < 24 && !(key[idx] == '\r' || key[idx] == '\n')) {
-            val[idx++] = key[idx];
+            val[idx] = key[idx];
+            idx++;
         }
         if (idx < 24) return -1; // 24 char key needed
         val[idx] = '\0';
 
-        unsigned char GUID[] = "258EAFA5-E914-47DA-95CA-C5ABDC257861";
+        unsigned char GUID[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
         unsigned char to_hash[strlen(GUID) + strlen(val) + 1], encoded[BUFSIZ];
 
         snprintf(to_hash, sizeof(to_hash), "%s%s", val, GUID);
@@ -232,14 +236,12 @@ int recv_sock(int fd, unsigned char* buffer, unsigned char** res, struct pollfd*
     // RECEVING FROM A CLIENT
     int len = 0, fin = 0, opcode;
 
-    while (1) {
-        int curr_len;
-        if ((curr_len = recv(fd, buffer + len, BUFSIZ - len - 1, 0)) < 0) break;
-        len += curr_len;
-        buffer[len] = '\0';
-        if (len >= 4 && memcmp(buffer + len - 4, "\r\n\r\n", 4) == 0) // double carriages only occur at the end
-            break;
-        if (len >= BUFSIZ - 1) return -1;
+    if ((len = recv(fd, buffer, BUFSIZ-1, 0)) < 0) {
+        return -1;
+    }
+    if (len == 0) {
+        remove_socket(fds, get_fd_idx(fds, fd, *num_clients), num_clients);
+        return -1;
     }
 
     buffer[len] = '\0';
@@ -262,8 +264,6 @@ int recv_sock(int fd, unsigned char* buffer, unsigned char** res, struct pollfd*
 
     if (opcode == WS_OP_CLOSE) {
         closing_handshake(fds, fd, num_clients);
-        int idx = get_fd_idx(fds, fd, *num_clients);
-        remove_socket(fds, idx, num_clients);
         return -10;
     }
 
@@ -344,7 +344,7 @@ int main() {
     }
 
     int bound = 0;
-    for (struct addrinfo *p = res; p != NULL; p = p->next) {
+    for (struct addrinfo *p = res; p != NULL; p = p->ai_next) {
         fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
         if (fd == -1) continue;
         int yes = 1;
@@ -371,13 +371,13 @@ int main() {
     struct pollfd *fds = malloc(sizeof(struct pollfd) * (MAX_CLIENTS + 1)); // one for listening fd
     fds[0] = (struct pollfd){fd, POLLIN};
 
-    int total_handshake = 0, handshake_failure = 0;
-    int total_frame_recv = 0, frame_recv_errors = 0;
+    float total_handshake = 0.0, handshake_failure = 0.0;
+    float total_frame_recv = 0.0, frame_recv_errors = 0.0;
 
     while (1) {
         int num_events = poll(fds, (num_clients + 1), 500);
         if (num_events > 0) {
-            get_resource_usage();
+            // get_resource_usage();
             for (int i = 0; i < num_clients + 1; i++) {
                 int events = fds[i].revents & (POLLIN | POLLHUP);
                 if (!events) continue;
@@ -386,23 +386,25 @@ int main() {
                     int client_fd = accept(fd, NULL, NULL);
                     
                     if (client_fd == -1) continue; // couldn't get client fd
-                    // fcntl(client_fd, F_SETFL, O_NONBLOCK); // making the client non-blocking for recv() and send() ops
+                    //fcntl(client_fd, F_SETFL, O_NONBLOCK); // making the client non-blocking for recv() and send() ops
 
-                    // handshake + latency
+                    // handshake + latency (probably should move handshake to polling to avoid blocking)
                     struct timespec start, end;
                     clock_gettime(CLOCK_MONOTONIC, &start);
                     status = handshake(client_fd);
-                    total_handshake++;
+                    total_handshake += 1;
+
                     if (status < 0) {
                         close(client_fd);
-                        handshake_failure++;
+                        handshake_failure += 1;
                         continue;
                     }
  
                     clock_gettime(CLOCK_MONOTONIC, &end);
                     double handshake_latency = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1000000000.0;
                     printf("Handshake latency for socket %d: %f seconds.\n", client_fd, handshake_latency);
-                    printf("Handshake failure rate: %f\n", float(handshake_failure)/float(total_handshake));
+                    float fail_rate = handshake_failure/total_handshake;
+                    //printf("Handshake failure rate: %f\n", fail_rate);
 
                     if (num_clients >= MAX_CLIENTS) {
                         char error_msg[] = "Maximum client limit reached, cannot connect.";
@@ -425,6 +427,7 @@ int main() {
                     total_frame_recv++;
                     if ((buf_size = recv_sock(fds[i].fd, buffer, &res, fds, &num_clients)) < 0 && buf_size != -10) {
                         fprintf(stderr, "Couldn't receive data from client with file descriptor: %d\n", fds[i].fd);
+                        remove_socket(fds, get_fd_idx(fds, fds[i].fd, num_clients), &num_clients);
                         frame_recv_errors++;
                         continue;
                     }
@@ -442,8 +445,9 @@ int main() {
                     
                     clock_gettime(CLOCK_MONOTONIC, &end);
                     double server_latency = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1000000000.0;
-                    printf("Server latency for socket %d: %f seconds.\n", fds[i].fd, server_latency);
-                    printf("Frame reception failure rate: %f\n", float(frame_recv_errors)/float(total_frame_recv));
+                    //printf("Server latency for socket %d: %f seconds.\n", fds[i].fd, server_latency);
+                    float err_rate = frame_recv_errors/total_frame_recv;
+                    //printf("Frame reception failure rate: %f\n", err_rate);
                     free(res);
                 }
             }
