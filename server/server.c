@@ -65,24 +65,27 @@ int handshake(int client_fd) {
     char buffer[BUFSIZ];
     int bytes_recv = 0;
     
-    if ((bytes_recv = recv(client_fd, buffer, BUFSIZ, 0)) < 0) {
+    if ((bytes_recv = recv(client_fd, buffer, BUFSIZ - 1, 0)) <= 0) {
         fprintf(stderr, "Could not perform handshake for client with file descriptor: %d\n", client_fd);
         return -1;
     }
+    buffer[bytes_recv] = '\0';
 
-    char *key, header[] = "Sec-WebSocket-Key";
+    char *key = NULL, header[] = "Sec-WebSocket-Key";
     key = strstr(buffer, header);
+    if (!key) return -1;
+    key = strchr(key, ' ');
+    if (!key) return -1;
+    key++;
     if (key) {
-        while (*key != ' ') key++;
-        key++;
-
         // key ptr now points to the start of the key
-        char* val = malloc(32); // the key is 16 bytes raw, 24 chars in Base64
+        char* val[25]; // the key is 16 bytes raw, 24 chars in Base64
         int idx = 0;
 
-        while (!(key[idx] == '\r' || key[idx] == '\n')) {
+        while (idx < 24 && !(key[idx] == '\r' || key[idx] == '\n')) {
             val[idx++] = key[idx];
         }
+        if (idx < 24) return -1; // 24 char key needed
         val[idx] = '\0';
 
         char GUID[] = "258EAFA5-E914-47DA-95CA-C5ABDC257861";
@@ -97,8 +100,6 @@ int handshake(int client_fd) {
         // Base64
         int bytes_written = EVP_EncodeBlock(encoded, sha1_result, SHA_DIGEST_LENGTH);
         encoded[bytes_written] = '\0';
-        
-        free(val);
 
         // send handshake confirmation string
 
@@ -316,6 +317,9 @@ int main() {
     struct pollfd *fds = malloc(sizeof(struct pollfd) * (MAX_CLIENTS + 1)); // one for listening fd
     fds[0] = (struct pollfd){fd, POLLIN};
 
+    int total_handshake = 0, handshake_failure = 0;
+    int total_frame_recv = 0, frame_recv_errors = 0;
+
     while (1) {
         int num_events = poll(fds, (MAX_CLIENTS + 1), 500);
         if (num_events > 0) {
@@ -332,13 +336,17 @@ int main() {
                     struct timespec start, end;
                     clock_gettime(CLOCK_MONOTONIC, &start);
                     status = handshake(client_fd);
+                    total_handshake++;
                     if (status < 0) {
                         close(client_fd);
+                        handshake_failure++;
                         continue;
                     }
+ 
                     clock_gettime(CLOCK_MONOTONIC, &end);
                     double handshake_latency = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1000000000.0;
                     printf("Handshake latency for socket %d: %f seconds.\n", fd, handshake_latency);
+                    printf("Handshake failure rate: %f\n", float(handshake_failure)/float(total_handshake));
 
                     if (num_clients >= MAX_CLIENTS) {
                         char error_msg[] = "Maximum client limit reached, cannot connect.";
@@ -357,9 +365,10 @@ int main() {
 
                     struct timespec start, end;
                     clock_gettime(CLOCK_MONOTONIC, &start);
-
+                    total_frame_recv++;
                     if ((buf_size = recv_sock(fds[i].fd, buffer, &res)) < 0 && buf_size != -10) {
                         fprintf(stderr, "Couldn't receive data from client with file descriptor: %d\n", fds[i].fd);
+                        frame_recv_errors++;
                         continue;
                     }
                     if (buf_size == -10) continue; // PING PONG logic | CLOSE logic
@@ -376,7 +385,7 @@ int main() {
                     clock_gettime(CLOCK_MONOTONIC, &end);
                     double server_latency = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1000000000.0;
                     printf("Server latency for socket %d: %f seconds.\n", fds[i].fd, server_latency);
-
+                    printf("Frame reception failure rate: %f\n", float(frame_recv_errors)/float(total_frame_recv));
                     free(res);
                 }
             }
