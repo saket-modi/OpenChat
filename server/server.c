@@ -205,13 +205,21 @@ int closing_handshake(struct pollfd* fds, int fd, int* num_clients) {
     }
     unsigned char payload[] = "CLOSE CONNECTION!";
     int payload_len = strlen(payload);
-    int frame_header[2];
+    unsigned char frame_header[2]; // a char is just an 8-bit integer in C
     frame_header[0] = 0x80 + WS_OP_CLOSE;
     frame_header[1] = payload_len; // no mask
+
+    if (send(fd, frame_header, 2, 0) < 0) {
+        return -1;
+    }
+    if (send(fd, payload, strlen(payload), 0) < 0) {
+        return -1;
+    }
+
     remove_socket(fds, idx, num_clients);
 }
 
-int recv_sock(int fd, unsigned char* buffer, unsigned char** res) {
+int recv_sock(int fd, unsigned char* buffer, unsigned char** res, struct pollfd* fds, int* num_clients) {
     // RECEVING FROM A CLIENT
     int len, fin = 0, opcode;
 
@@ -235,7 +243,7 @@ int recv_sock(int fd, unsigned char* buffer, unsigned char** res) {
     opcode = buffer[offset] & 0x0F;
 
     if (opcode == WS_OP_CLOSE) {
-        closing_handshake(fd);
+        closing_handshake(fds, fd, num_clients);
         while (remove_socket(fd) < 0);
         return -10;
     }
@@ -381,7 +389,7 @@ int main() {
                     struct timespec start, end;
                     clock_gettime(CLOCK_MONOTONIC, &start);
                     total_frame_recv++;
-                    if ((buf_size = recv_sock(fds[i].fd, buffer, &res)) < 0 && buf_size != -10) {
+                    if ((buf_size = recv_sock(fds[i].fd, buffer, &res, fds, &num_clients)) < 0 && buf_size != -10) {
                         fprintf(stderr, "Couldn't receive data from client with file descriptor: %d\n", fds[i].fd);
                         frame_recv_errors++;
                         continue;
