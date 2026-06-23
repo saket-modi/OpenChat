@@ -8,7 +8,8 @@
 #include <openssl/sha.h> // for hashing
 #include <openssl/evp.h> // for base64 encoding
 #include <stdint.h>
-#include <time.h>
+#include <time.h> // for latency
+#include <sys/resource.h>
 
 #define MAX_CLIENTS 10
 
@@ -18,6 +19,22 @@
 #define WS_OP_CLOSE 0x8
 #define WS_OP_PING 0x9
 #define WS_OP_PONG 0xA
+
+void get_memory_usage() {
+    time_t raw_time;
+    time(&raw_time);
+    struct tm *utc_time;
+    char curr_time[100];
+    utc_time = gmtime(&raw_time);
+    strftime(curr_time, 100, "%Y-%m-%d %H:%M:%S UTC", utc_time);
+
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) == 0) {
+        printf("Memory usage at time %s GMT: %ld KB.\n", curr_time, usage.ru_maxrss);
+    } else {
+        fprintf(stderr, "Couldn't get memory usage at time: %s GMT.\n", curr_time);
+    }
+}
 
 char* str_to_JSON(char* text, int user) {
     time_t raw_time;
@@ -35,7 +52,7 @@ char* str_to_JSON(char* text, int user) {
 
 int remove_socket(struct pollfd *fds, int i, int* num_clients) {
     close(fds[i].fd);
-    fds[i] = fds[--(*num_clients)];
+    fds[i] = fds[(*num_clients)--];
 }
 
 int send_pong(int fd) {
@@ -284,6 +301,7 @@ int main() {
     while (1) {
         int num_events = poll(fds, (MAX_CLIENTS + 1), 500);
         if (num_events > 0) {
+            get_memory_usage();
             for (int i = 0; i < num_clients + 1; i++) {
                 int events = fds[i].revents & (POLLIN | POLLHUP);
                 if (!events) continue;
@@ -291,7 +309,15 @@ int main() {
                     // client handling logic
                     int client_fd = accept(fd, NULL, NULL);
                     if (client_fd == -1) continue; // couldn't get client fd
+
+                    // handshake + latency
+                    time_t before_handshake;
+                    time(&before_handshake);
                     handshake(client_fd);
+                    time_t after_handshake;
+                    time(&after_handshake);
+                    int handshake_latency = difftime(after_handshake, before_handshake);
+                    printf("Handshake latency for socket %d: %f seconds.", fd, handshake_latency);
 
                     if (num_clients >= MAX_CLIENTS) {
                         char error_msg[] = "Maximum client limit reached, cannot connect.";
@@ -308,6 +334,9 @@ int main() {
                     char buffer[BUFSIZ], *res = NULL;
                     int buf_size;
 
+                    time_t before_sending;
+                    time(&before_sending);
+
                     if ((buf_size = recv_sock(fds[i].fd, buffer, &res)) < 0) {
                         fprintf(stderr, "Couldn't receive data from client with file descriptor: %d", fds[i].fd);
                     }
@@ -320,6 +349,11 @@ int main() {
                         if (j == i) continue; // don't send msg to same user
                         send_sock(fds[j].fd, *res);
                     }
+
+                    time_t after_sending;
+                    time(&after_sending);
+                    double server_latency = difftime(before_sending, after_sending);
+                    printf("Server latency for socket %d: %f seconds.", fds[i].fd, server_latency);
                 }
             }
         }
