@@ -20,7 +20,7 @@
 #define WS_OP_PING 0x9
 #define WS_OP_PONG 0xA
 
-void get_memory_usage() {
+void get_resource_usage() {
     time_t raw_time;
     time(&raw_time);
     struct tm *utc_time;
@@ -31,8 +31,10 @@ void get_memory_usage() {
     struct rusage usage;
     if (getrusage(RUSAGE_SELF, &usage) == 0) {
         printf("Memory usage at time %s GMT: %ld KB.\n", curr_time, usage.ru_maxrss);
+        printf("Time spent executing in user mode: %ld seconds.\n", usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1000000.0);
+        printf("Time spent executing in kernel mode: %ld seconds.\n", usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1000000.0);
     } else {
-        fprintf(stderr, "Couldn't get memory usage at time: %s GMT.\n", curr_time);
+        fprintf(stderr, "Couldn't get resource usage at time: %s GMT.\n", curr_time);
     }
 }
 
@@ -51,17 +53,77 @@ char* str_to_JSON(char* text, int user) {
 }
 
 int remove_socket(struct pollfd *fds, int i, int* num_clients) {
-    close(fds[i].fd);
+    if (close(fds[i].fd) < 0) {
+        return -1;
+    }
     fds[i] = fds[(*num_clients)--];
+    return 0;
 }
 
-int send_pong(int fd) {
-    char payload[] = "PONG!";
-    int payload_len = 5;
+int handshake(int client_fd) {
+    // get upgrade request from connected socket
+    char buffer[BUFSIZ];
+    int bytes_recv = 0;
+    
+    if ((bytes_recv = recv(client_fd, buffer, BUFSIZ, 0)) < 0) {
+        fprintf(stderr, "Could not perform handshake for client with file descriptor: %d\n", client_fd);
+        return -1;
+    }
+
+    char *key, header[] = "Sec-WebSocket-Key";
+    key = strstr(buffer, header);
+    if (key) {
+        while (*key != ' ') key++;
+        key++;
+
+        // key ptr now points to the start of the key
+        char* val = malloc(32); // the key is 16 bytes raw, 24 chars in Base64
+        int idx = 0;
+
+        while (!(key[idx] == '\r' || key[idx] == '\n')) {
+            val[idx++] = key[idx];
+        }
+        val[idx] = '\0';
+
+        char GUID[] = "258EAFA5-E914-47DA-95CA-C5ABDC257861";
+        char to_hash[strlen(GUID) + strlen(val) + 1], encoded[BUFSIZ];
+
+        snprintf(to_hash, sizeof(to_hash), "%s%s", val, GUID);
+
+        // SHA-1 mapping
+        unsigned char sha1_result[SHA_DIGEST_LENGTH];
+        SHA1((unsigned char*)to_hash, strlen(to_hash), sha1_result);
+
+        // Base64
+        int bytes_written = EVP_EncodeBlock(encoded, sha1_result, SHA_DIGEST_LENGTH);
+        encoded[bytes_written] = '\0';
+        
+        free(val);
+
+        // send handshake confirmation string
+
+        char confirmation[BUFSIZ];
+        snprintf(confirmation, BUFSIZ, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-Websocket-Accept: %s\r\n\r\n", encoded);
+        if (send(client_fd, confirmation, strlen(confirmation), 0) < 0) {
+            fprintf(stderr, "Could not perform handshake for client with file descriptor: %d\n", client_fd);
+            return -1;
+        }
+
+    } else {
+        fprintf(stderr, "Could not perform handshake for client with file descriptor: %d\n", client_fd);
+        return -1;
+    }
+}
+
+int send_pong(int fd, char* payload) {
+    if (strlen(payload) > 125) {
+        payload[124] = '\0';
+    }
+    int payload_len = strlen(payload);
 
     char frame_header[2];
     frame_header[0] = 0x80 + WS_OP_PONG;
-    frame_header[1] = 5;
+    frame_header[1] = payload_len;
 
     int status;
     if ((status = send(fd, frame_header, 2, 0)) < 0) {
@@ -70,15 +132,16 @@ int send_pong(int fd) {
     if ((status = send(fd, payload, payload_len, 0)) < 0) {
         return -1;
     }
+    return 0;
 }
 
 // SENDING & RECEIVING LOGIC FOLLOWS RFC 6455 (https://datatracker.ietf.org/doc/html/rfc6455)
-int send_sock(int fd, char* payload) {
-    // SENDING TO A CLIENT (payload is the string of text to be sent)
+int send_sock(int fd, int sender_fd, char* payload) {
+    // SENDING TO A CLIENT WITH FD=FD FROM FD=SENDER_FD (payload is the string of text to be sent)
     int status;
     char buffer[BUFSIZ];
     char frame[10];
-    payload = str_to_JSON(payload, fd);
+    payload = str_to_JSON(payload, sender_fd);
     int payload_len = strlen(payload), header_len = 1;
 
     frame[0] = 0x80 + WS_OP_TEXT; // FIN + OPCODE
@@ -96,23 +159,25 @@ int send_sock(int fd, char* payload) {
         header_len = 4;
     } else {
         frame[1] = 127;
-        frame_header[2] = (payload_len >> 56) & 0xFF;
-        frame_header[3] = (payload_len >> 48) & 0xFF;
-        frame_header[4] = (payload_len >> 40) & 0xFF;
-        frame_header[5] = (payload_len >> 32) & 0xFF;
-        frame_header[6] = (payload_len >> 24) & 0xFF;
-        frame_header[7] = (payload_len >> 16) & 0xFF;
-        frame_header[8] = (payload_len >> 8) & 0xFF;
-        frame_header[9] =  payload_len & 0xFF;
+        frame[2] = (payload_len >> 56) & 0xFF;
+        frame[3] = (payload_len >> 48) & 0xFF;
+        frame[4] = (payload_len >> 40) & 0xFF;
+        frame[5] = (payload_len >> 32) & 0xFF;
+        frame[6] = (payload_len >> 24) & 0xFF;
+        frame[7] = (payload_len >> 16) & 0xFF;
+        frame[8] = (payload_len >> 8) & 0xFF;
+        frame[9] =  payload_len & 0xFF;
         header_len = 10;
     }
 
     // MSG_NOSIGNAL returns -1 in case the client abruptly closes the browser tab
-    if ((status = send(fd, frame_header, header_len, MSG_NOSIGNAL)) < 0) {
+    if ((status = send(fd, frame, header_len, MSG_NOSIGNAL)) < 0) {
+        free(payload);
         return -1;
     }
     
     if ((status = send(fd, payload, payload_len, MSG_NOSIGNAL)) < 0) {
+        free(payload);
         return -1;
     }
     free(payload);
@@ -126,11 +191,15 @@ int recv_full(int fd, char* buffer, int len) {
     return 0;
 }
 
+int closing_handshake(int fd) {
+
+}
+
 int recv_sock(int fd, char* buffer, char** res) {
     // RECEVING FROM A CLIENT
     int len, fin = 0, opcode;
 
-    if ((len = recv(fd, buffer, BUFSIZ)) < 0) return -1;
+    if ((len = recv(fd, buffer, BUFSIZ - 1)) < 0) return -1;
     buffer[len] = '\0';
     int offset = 0; // processed bytes
 
@@ -149,9 +218,10 @@ int recv_sock(int fd, char* buffer, char** res) {
     if (rsv1 || rsv2 || rsv3) return -1; // they should be 0
     opcode = buffer[offset] & 0x0F;
 
-    if (opcode == WS_OP_PING) {
-        send_pong(fd);
-        return 0;
+    if (opcode == WS_OP_CLOSE) {
+        closing_handshake(fd);
+        while (remove_socket(fd) < 0);
+        return -10;
     }
 
     offset = 1; 
@@ -196,64 +266,12 @@ int recv_sock(int fd, char* buffer, char** res) {
     }
     (*res)[payload_length] = '\0';
 
+    if (opcode == WS_OP_PING) {
+        while (send_pong(fd, res) < 0);
+        return -10;
+    }
+
     return len;
-}
-
-int handshake(int client_fd) {
-    // get upgrade request from connected socket
-    char buffer[BUFSIZ];
-    int bytes_recv = 0;
-    
-    if ((bytes_recv = recv(client_fd, buffer, BUFSIZ, 0)) < 0) {
-        fprintf(stderr, "Could not perform handshake for client with file descriptor: %d", client_fd);
-        return;
-    }
-
-    char *key, header[] = "Sec-WebSocket-Key";
-    key = strstr(buffer, header);
-    if (key) {
-        while (*key != ' ') key++;
-        key++;
-
-        // key ptr now points to the start of the key
-        char* val = malloc(32); // the key is 16 bytes raw, 24 chars in Base64
-        int idx = 0;
-
-        while (!(key[idx] == '\r' || key[idx] == '\n')) {
-            val[idx++] = key[idx];
-        }
-        val[idx] = '\0';
-
-        char GUID[] = "258EAFA5-E914-47DA-95CA-C5ABDC257861";
-        char to_hash[strlen(GUID) + strlen(val) + 1], encoded[BUFSIZ];
-
-        snprintf(to_hash, sizeof(to_hash), "%s%s", val, GUID);
-
-        // SHA-1 mapping
-        unsigned char sha1_result[SHA_DIGEST_LENGTH];
-        SHA1((unsigned char*)to_hash, strlen(to_hash), sha1_result);
-
-        // Base64
-        int bytes_written = EVP_EncodeBlock(encoded, sha1_result, SHA_DIGEST_LENGTH);
-        encoded[bytes_written] = '\0';
-        
-        free(val);
-
-        // send handshake confirmation string
-
-        char confirmation[BUFSIZ];
-        snprintf(confirmation, BUFSIZ, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-Websocket-Accept: %s\r\n\r\n", encoded);
-        if (send(client_fd, confirmation, strlen(confirmation), 0) < 0) {
-            fprintf(stderr, "Could not perform handshake for client with file descriptor: %d", client_fd);
-            free(confirmation);
-            free(encoded);
-            return;
-        }
-
-    } else {
-        fprintf(stderr, "Could not perform handshake for client with file descriptor: %d", client_fd);
-        return;
-    }
 }
 
 int main() {
@@ -290,7 +308,7 @@ int main() {
     }
 
     if (listen(fd, SOMAXCONN) < 0) {
-        fprintf(stderr, "Could not assign server to listen to port.");
+        fprintf(stderr, "Could not assign server to listen to port.\n");
         exit(EXIT_FAILURE);
     }
 
@@ -301,7 +319,7 @@ int main() {
     while (1) {
         int num_events = poll(fds, (MAX_CLIENTS + 1), 500);
         if (num_events > 0) {
-            get_memory_usage();
+            get_resource_usage();
             for (int i = 0; i < num_clients + 1; i++) {
                 int events = fds[i].revents & (POLLIN | POLLHUP);
                 if (!events) continue;
@@ -311,17 +329,20 @@ int main() {
                     if (client_fd == -1) continue; // couldn't get client fd
 
                     // handshake + latency
-                    time_t before_handshake;
-                    time(&before_handshake);
-                    handshake(client_fd);
-                    time_t after_handshake;
-                    time(&after_handshake);
-                    int handshake_latency = difftime(after_handshake, before_handshake);
-                    printf("Handshake latency for socket %d: %f seconds.", fd, handshake_latency);
+                    struct timespec start, end;
+                    clock_gettime(CLOCK_MONOTONIC, &start);
+                    status = handshake(client_fd);
+                    if (status < 0) {
+                        close(client_fd);
+                        continue;
+                    }
+                    clock_gettime(CLOCK_MONOTONIC, &end);
+                    double handshake_latency = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1000000000.0;
+                    printf("Handshake latency for socket %d: %f seconds.\n", fd, handshake_latency);
 
                     if (num_clients >= MAX_CLIENTS) {
                         char error_msg[] = "Maximum client limit reached, cannot connect.";
-                        send_sock(client_fd, error_msg);
+                        send_sock(client_fd, 0, error_msg);
                         close(client_fd);
                     } else {
                         fds[++num_clients] = (struct pollfd){client_fd, POLLIN};
@@ -329,31 +350,34 @@ int main() {
                 }
                 else if (fds[i].revents & POLLHUP) { // connection terminated
                     // remove socket connection to add page to bfcache
-                    remove_socket(fds, i, &num_clients);
+                    while (remove_socket(fds, i, &num_clients) < 0);
                 } else {
                     char buffer[BUFSIZ], *res = NULL;
                     int buf_size;
 
-                    time_t before_sending;
-                    time(&before_sending);
+                    struct timespec start, end;
+                    clock_gettime(CLOCK_MONOTONIC, &start);
 
-                    if ((buf_size = recv_sock(fds[i].fd, buffer, &res)) < 0) {
-                        fprintf(stderr, "Couldn't receive data from client with file descriptor: %d", fds[i].fd);
+                    if ((buf_size = recv_sock(fds[i].fd, buffer, &res)) < 0 && buf_size != -10) {
+                        fprintf(stderr, "Couldn't receive data from client with file descriptor: %d\n", fds[i].fd);
+                        continue;
                     }
+                    if (buf_size == -10) continue; // PING PONG logic | CLOSE logic
                     if (buf_size == 0) {
-                        remove_socket(fds, i, &num_clients);
+                        while (remove_socket(fds, i, &num_clients) < 0);
                         continue;
                     }
 
                     for (int j = 1; j < num_clients + 1; j++) {
                         if (j == i) continue; // don't send msg to same user
-                        send_sock(fds[j].fd, *res);
+                        send_sock(fds[j].fd, fds[i].fd, res);
                     }
+                    
+                    clock_gettime(CLOCK_MONOTONIC, &end);
+                    double server_latency = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1000000000.0;
+                    printf("Server latency for socket %d: %f seconds.\n", fds[i].fd, server_latency);
 
-                    time_t after_sending;
-                    time(&after_sending);
-                    double server_latency = difftime(before_sending, after_sending);
-                    printf("Server latency for socket %d: %f seconds.", fds[i].fd, server_latency);
+                    free(res);
                 }
             }
         }
