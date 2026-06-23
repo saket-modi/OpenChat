@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <time.h> // for latency
 #include <sys/resource.h>
+#include <fcntl.h>
 
 #define MAX_CLIENTS 10
 
@@ -31,8 +32,8 @@ void get_resource_usage() {
     struct rusage usage;
     if (getrusage(RUSAGE_SELF, &usage) == 0) {
         printf("Memory usage at time %s GMT: %ld KB.\n", curr_time, usage.ru_maxrss);
-        printf("Time spent executing in user mode: %ld seconds.\n", usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1000000.0);
-        printf("Time spent executing in kernel mode: %ld seconds.\n", usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1000000.0);
+        printf("Time spent executing in user mode: %f seconds.\n", usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1000000.0);
+        printf("Time spent executing in kernel mode: %f seconds.\n", usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1000000.0);
     } else {
         fprintf(stderr, "Couldn't get resource usage at time: %s GMT.\n", curr_time);
     }
@@ -71,15 +72,15 @@ int handshake(int client_fd) {
     }
     buffer[bytes_recv] = '\0';
 
-    unsigned char *key = NULL, header[] = "Sec-WebSocket-Key";
+    unsigned char *key = NULL, header[] = "Sec-WebSocket-Key:";
     key = strstr(buffer, header);
     if (!key) return -1;
-    key = strchr(key, ' ');
-    if (!key) return -1;
-    key++;
+    key += strlen("Sec-WebSocket-Key:");
+    while (*key == ' ') key++;
+
     if (key) {
         // key ptr now points to the start of the key
-        unsigned char* val[25]; // the key is 16 bytes raw, 24 chars in Base64
+        unsigned char val[25]; // the key is 16 bytes raw, 24 chars in Base64
         int idx = 0;
 
         while (idx < 24 && !(key[idx] == '\r' || key[idx] == '\n')) {
@@ -104,8 +105,8 @@ int handshake(int client_fd) {
         // send handshake confirmation string
 
         unsigned char confirmation[BUFSIZ];
-        snprintf(confirmation, BUFSIZ, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-Websocket-Accept: %s\r\n\r\n", encoded);
-        if (send(client_fd, confirmation, strlen(confirmation), 0) < 0) {
+        snprintf(confirmation, BUFSIZ, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", encoded);
+        if (send(client_fd, confirmation, strlen(confirmation), MSG_NOSIGNAL) < 0) {
             fprintf(stderr, "Could not perform handshake for client with file descriptor: %d\n", client_fd);
             return -1;
         }
@@ -114,6 +115,7 @@ int handshake(int client_fd) {
         fprintf(stderr, "Could not perform handshake for client with file descriptor: %d\n", client_fd);
         return -1;
     }
+    return 0;
 }
 
 int send_pong(int fd, char* payload) {
@@ -127,10 +129,10 @@ int send_pong(int fd, char* payload) {
     frame_header[1] = payload_len;
 
     int status;
-    if ((status = send(fd, frame_header, 2, 0)) < 0) {
+    if ((status = send(fd, frame_header, 2, MSG_NOSIGNAL)) < 0) {
         return -1;
     }
-    if ((status = send(fd, payload, payload_len, 0)) < 0) {
+    if ((status = send(fd, payload, payload_len, MSG_NOSIGNAL)) < 0) {
         return -1;
     }
     return 0;
@@ -191,39 +193,53 @@ int recv_full(int fd, unsigned char* buffer, int len) {
     return 0;
 }
 
-int closing_handshake(struct pollfd* fds, int fd, int* num_clients) {
+int get_fd_idx(struct pollfd* fds, int fd, int num_clients) {
     int idx = -1;
-    for (int i = 1; i < num_clients; i++) {
+    for (int i = 1; i < num_clients + 1; i++) {
         if (fds[i].fd == fd) {
             idx = i;
             break;
         }
     }
-    if (idx == -1) {
-        // already been removed so no closing handshake needed
-        return 0;
-    }
+    return idx;
+}
+
+int closing_handshake(struct pollfd* fds, int fd, int* num_clients) {
+    int idx = get_fd_idx(fds, fd, *num_clients);
+    if (idx < 0) return 0; // already removed
     unsigned char payload[] = "CLOSE CONNECTION!";
     int payload_len = strlen(payload);
     unsigned char frame_header[2]; // a char is just an 8-bit integer in C
     frame_header[0] = 0x80 + WS_OP_CLOSE;
     frame_header[1] = payload_len; // no mask
 
-    if (send(fd, frame_header, 2, 0) < 0) {
+    if (send(fd, frame_header, 2, MSG_NOSIGNAL) < 0) {
         return -1;
     }
-    if (send(fd, payload, strlen(payload), 0) < 0) {
+    if (send(fd, payload, strlen(payload), MSG_NOSIGNAL) < 0) {
         return -1;
     }
-
+    int idx = get_fd_idx(fds, fd, *num_clients);
+    if (idx < 0) return 0; // already removed connection
     remove_socket(fds, idx, num_clients);
+    return 0;
 }
 
+// TODO: READ THE PAYLOAD LENGTH INSTEAD OF STORING EVERYTHING IN THE BUFFER!!!
 int recv_sock(int fd, unsigned char* buffer, unsigned char** res, struct pollfd* fds, int* num_clients) {
     // RECEVING FROM A CLIENT
-    int len, fin = 0, opcode;
+    int len = 0, fin = 0, opcode;
 
-    if ((len = recv(fd, buffer, BUFSIZ - 1)) < 0) return -1;
+    while (1) {
+        int curr_len;
+        if ((curr_len = recv(fd, buffer + len, BUFSIZ - len - 1, 0)) < 0) break;
+        len += curr_len;
+        buffer[len] = '\0';
+        if (len >= 4 && memcmp(buffer + len - 4, "\r\n\r\n", 4) == 0) // double carriages only occur at the end
+            break;
+        if (len >= BUFSIZ - 1) return -1;
+    }
+
     buffer[len] = '\0';
     int offset = 0; // processed bytes
 
@@ -244,8 +260,20 @@ int recv_sock(int fd, unsigned char* buffer, unsigned char** res, struct pollfd*
 
     if (opcode == WS_OP_CLOSE) {
         closing_handshake(fds, fd, num_clients);
-        while (remove_socket(fd) < 0);
+        remove_socket(fds, i, num_clients);
         return -10;
+    }
+
+    // can't handle other opcodes
+    switch(opcode) {
+        case WS_OP_TEXT:
+        case WS_OP_PING:
+        case WS_OP_PONG:
+        case WS_OP_CLOSE:
+            return -1;
+
+        default:
+            return -1;
     }
 
     offset = 1; 
@@ -291,7 +319,7 @@ int recv_sock(int fd, unsigned char* buffer, unsigned char** res, struct pollfd*
     (*res)[payload_length] = '\0';
 
     if (opcode == WS_OP_PING) {
-        while (send_pong(fd, res) < 0);
+        send_pong(fd, (char*)(*res));
         return -10;
     }
 
@@ -344,7 +372,7 @@ int main() {
     int total_frame_recv = 0, frame_recv_errors = 0;
 
     while (1) {
-        int num_events = poll(fds, (MAX_CLIENTS + 1), 500);
+        int num_events = poll(fds, (num_clients + 1), 500);
         if (num_events > 0) {
             get_resource_usage();
             for (int i = 0; i < num_clients + 1; i++) {
@@ -353,7 +381,9 @@ int main() {
                 if (fds[i].fd == fd) {
                     // client handling logic
                     int client_fd = accept(fd, NULL, NULL);
+                    
                     if (client_fd == -1) continue; // couldn't get client fd
+                    fcntl(client_fd, F_SETFL, O_NONBLOCK); // making the client non-blocking for recv() and send() ops
 
                     // handshake + latency
                     struct timespec start, end;
@@ -368,7 +398,7 @@ int main() {
  
                     clock_gettime(CLOCK_MONOTONIC, &end);
                     double handshake_latency = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1000000000.0;
-                    printf("Handshake latency for socket %d: %f seconds.\n", fd, handshake_latency);
+                    printf("Handshake latency for socket %d: %f seconds.\n", client_fd, handshake_latency);
                     printf("Handshake failure rate: %f\n", float(handshake_failure)/float(total_handshake));
 
                     if (num_clients >= MAX_CLIENTS) {
@@ -381,7 +411,7 @@ int main() {
                 }
                 else if (fds[i].revents & POLLHUP) { // connection terminated
                     // remove socket connection to add page to bfcache
-                    while (remove_socket(fds, i, &num_clients) < 0);
+                    remove_socket(fds, i, &num_clients);
                 } else {
                     unsigned char buffer[BUFSIZ], *res = NULL;
                     int buf_size;
@@ -396,7 +426,7 @@ int main() {
                     }
                     if (buf_size == -10) continue; // PING PONG logic | CLOSE logic
                     if (buf_size == 0) {
-                        while (remove_socket(fds, i, &num_clients) < 0);
+                        remove_socket(fds, i, &num_clients);
                         continue;
                     }
 
