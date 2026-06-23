@@ -62,7 +62,7 @@ int remove_socket(struct pollfd *fds, int i, int* num_clients) {
 
 int handshake(int client_fd) {
     // get upgrade request from connected socket
-    char buffer[BUFSIZ];
+    unsigned char buffer[BUFSIZ];
     int bytes_recv = 0;
     
     if ((bytes_recv = recv(client_fd, buffer, BUFSIZ - 1, 0)) <= 0) {
@@ -71,7 +71,7 @@ int handshake(int client_fd) {
     }
     buffer[bytes_recv] = '\0';
 
-    char *key = NULL, header[] = "Sec-WebSocket-Key";
+    unsigned char *key = NULL, header[] = "Sec-WebSocket-Key";
     key = strstr(buffer, header);
     if (!key) return -1;
     key = strchr(key, ' ');
@@ -79,7 +79,7 @@ int handshake(int client_fd) {
     key++;
     if (key) {
         // key ptr now points to the start of the key
-        char* val[25]; // the key is 16 bytes raw, 24 chars in Base64
+        unsigned char* val[25]; // the key is 16 bytes raw, 24 chars in Base64
         int idx = 0;
 
         while (idx < 24 && !(key[idx] == '\r' || key[idx] == '\n')) {
@@ -88,8 +88,8 @@ int handshake(int client_fd) {
         if (idx < 24) return -1; // 24 char key needed
         val[idx] = '\0';
 
-        char GUID[] = "258EAFA5-E914-47DA-95CA-C5ABDC257861";
-        char to_hash[strlen(GUID) + strlen(val) + 1], encoded[BUFSIZ];
+        unsigned char GUID[] = "258EAFA5-E914-47DA-95CA-C5ABDC257861";
+        unsigned char to_hash[strlen(GUID) + strlen(val) + 1], encoded[BUFSIZ];
 
         snprintf(to_hash, sizeof(to_hash), "%s%s", val, GUID);
 
@@ -103,7 +103,7 @@ int handshake(int client_fd) {
 
         // send handshake confirmation string
 
-        char confirmation[BUFSIZ];
+        unsigned char confirmation[BUFSIZ];
         snprintf(confirmation, BUFSIZ, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-Websocket-Accept: %s\r\n\r\n", encoded);
         if (send(client_fd, confirmation, strlen(confirmation), 0) < 0) {
             fprintf(stderr, "Could not perform handshake for client with file descriptor: %d\n", client_fd);
@@ -122,7 +122,7 @@ int send_pong(int fd, char* payload) {
     }
     int payload_len = strlen(payload);
 
-    char frame_header[2];
+    unsigned char frame_header[2];
     frame_header[0] = 0x80 + WS_OP_PONG;
     frame_header[1] = payload_len;
 
@@ -137,11 +137,10 @@ int send_pong(int fd, char* payload) {
 }
 
 // SENDING & RECEIVING LOGIC FOLLOWS RFC 6455 (https://datatracker.ietf.org/doc/html/rfc6455)
-int send_sock(int fd, int sender_fd, char* payload) {
+int send_sock(int fd, int sender_fd, unsigned char* payload) {
     // SENDING TO A CLIENT WITH FD=FD FROM FD=SENDER_FD (payload is the string of text to be sent)
     int status;
-    char buffer[BUFSIZ];
-    char frame[10];
+    unsigned char frame[10];
     payload = str_to_JSON(payload, sender_fd);
     int payload_len = strlen(payload), header_len = 1;
 
@@ -185,18 +184,34 @@ int send_sock(int fd, int sender_fd, char* payload) {
     return header_len + payload_len;
 }
 
-int recv_full(int fd, char* buffer, int len) {
+int recv_full(int fd, unsigned char* buffer, int len) {
     /*
         Each subsequent payload will contain its own headers, masking key, etc.
     */
     return 0;
 }
 
-int closing_handshake(int fd) {
-
+int closing_handshake(struct pollfd* fds, int fd, int* num_clients) {
+    int idx = -1;
+    for (int i = 1; i < num_clients; i++) {
+        if (fds[i].fd == fd) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx == -1) {
+        // already been removed so no closing handshake needed
+        return 0;
+    }
+    unsigned char payload[] = "CLOSE CONNECTION!";
+    int payload_len = strlen(payload);
+    int frame_header[2];
+    frame_header[0] = 0x80 + WS_OP_CLOSE;
+    frame_header[1] = payload_len; // no mask
+    remove_socket(fds, idx, num_clients);
 }
 
-int recv_sock(int fd, char* buffer, char** res) {
+int recv_sock(int fd, unsigned char* buffer, unsigned char** res) {
     // RECEVING FROM A CLIENT
     int len, fin = 0, opcode;
 
@@ -251,19 +266,19 @@ int recv_sock(int fd, char* buffer, char** res) {
         return -1;
     }
 
-    char* mask = &buffer[offset]; // there are four mask keys, to be alternated with MOD 4
+    unsigned char* mask = &buffer[offset]; // there are four mask keys, to be alternated with MOD 4
     offset += 4;
 
     if (len < offset + payload_length) {
         // the length of the text should match the actual payload received for malloc-ing
         return -1;
     }
-    char* payload = &buffer[offset];
+    unsigned char* payload = &buffer[offset];
 
     *res = malloc(payload_length + 1);
 
     for (int i = 0; i < payload_length; i++) {
-        (*res)[i] = (char)(payload[i] ^ mask[i % 4]);
+        (*res)[i] = (unsigned char)(payload[i] ^ mask[i % 4]);
     }
     (*res)[payload_length] = '\0';
 
@@ -360,7 +375,7 @@ int main() {
                     // remove socket connection to add page to bfcache
                     while (remove_socket(fds, i, &num_clients) < 0);
                 } else {
-                    char buffer[BUFSIZ], *res = NULL;
+                    unsigned char buffer[BUFSIZ], *res = NULL;
                     int buf_size;
 
                     struct timespec start, end;
