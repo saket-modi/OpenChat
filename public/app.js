@@ -1,9 +1,7 @@
-const WebSocket = require("ws")
-
 const sendBtn = document.getElementById("sendButton")
 const msgBox = document.getElementById("messageBox")
 const chatArea = document.getElementById("chatArea")
-const socket = null
+let socket
 const host = "ws://localhost:6767"
 
 let messages = []

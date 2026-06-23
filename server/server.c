@@ -31,7 +31,7 @@ void get_resource_usage() {
 
     struct rusage usage;
     if (getrusage(RUSAGE_SELF, &usage) == 0) {
-        printf("Memory usage at time %s GMT: %ld KB.\n", curr_time, usage.ru_maxrss);
+        printf("\r\n\r\nMemory usage at time %s GMT: %ld KB.\n", curr_time, usage.ru_maxrss);
         printf("Time spent executing in user mode: %f seconds.\n", usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1000000.0);
         printf("Time spent executing in kernel mode: %f seconds.\n", usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1000000.0);
     } else {
@@ -377,7 +377,7 @@ int main() {
     while (1) {
         int num_events = poll(fds, (num_clients + 1), 500);
         if (num_events > 0) {
-            // get_resource_usage();
+            get_resource_usage();
             for (int i = 0; i < num_clients + 1; i++) {
                 int events = fds[i].revents & (POLLIN | POLLHUP);
                 if (!events) continue;
@@ -404,7 +404,7 @@ int main() {
                     double handshake_latency = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1000000000.0;
                     printf("Handshake latency for socket %d: %f seconds.\n", client_fd, handshake_latency);
                     float fail_rate = handshake_failure/total_handshake;
-                    //printf("Handshake failure rate: %f\n", fail_rate);
+                    printf("Handshake failure rate: %f\n", fail_rate);
 
                     if (num_clients >= MAX_CLIENTS) {
                         char error_msg[] = "Maximum client limit reached, cannot connect.";
@@ -445,9 +445,9 @@ int main() {
                     
                     clock_gettime(CLOCK_MONOTONIC, &end);
                     double server_latency = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1000000000.0;
-                    //printf("Server latency for socket %d: %f seconds.\n", fds[i].fd, server_latency);
+                    printf("Server latency for socket %d: %f seconds.\n", fds[i].fd, server_latency);
                     float err_rate = frame_recv_errors/total_frame_recv;
-                    //printf("Frame reception failure rate: %f\n", err_rate);
+                    printf("Frame reception failure rate: %f\n", err_rate);
                     free(res);
                 }
             }
